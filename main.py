@@ -21,6 +21,33 @@ from model import BertEncoder, Classifier
 from data_process import FewRelProcessor, tacredProcessor
 from utils import collate_fn, save_checkpoint, get_prototypes, memory_select, set_random_seed, compute_cos_sim, get_augmentative_data
 
+import copy
+import logging
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+def get_logger(args):
+    """创建并配置日志记录器"""
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.INFO)
+
+    if not logger.handlers:
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+
+        if args.log_path:
+            file_handler = logging.FileHandler(args.log_path)
+            file_handler.setLevel(logging.INFO)
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+
+    return logger
+
 default_print = "\033[0m"
 blue_print = "\033[1;34;40m"
 yellow_print = "\033[1;33;40m"
@@ -43,102 +70,143 @@ def setup_logging(log_dir):
     )
     return logging.getLogger()
 
+
 def do_train(args, tokenizer, processor, i_exp):
-    logger = setup_logging(args.log_dir)  # 初始化日志
-    logger.info("Starting training...")
-    #增加log
+    """完整训练流程，包含攻击评估与性能对比"""
+    # 初始化日志和设备
+    logger = get_logger(args)
+    device = args.device
+    blue_print = "\033[1;34;40m"
+    green_print = "\033[1;32;40m"
+    red_print = "\033[1;31;40m"
+    default_print = "\033[0m"
 
-    memory = []
-    memory_len = []
-    relations = []
-    testset = []
-    prev_encoder, prev_classifier = None, None
-    taskdatas = processor.get()
-    rel2id = processor.get_rel2id() # {"rel": id}
-    task_acc, memory_acc = [], []
-    prototypes = None
+    # 加载数据处理器和关系映射
+    rel2id = processor.get_rel2id()
+    num_relations = len(rel2id)
+    logger.info(f"Total relations: {num_relations}")
 
+    # 初始化模型组件
+    current_encoder = BertEncoder(args, tokenizer, encode_style=args.encode_style)
+    current_classifier = Classifier(args, num_relations=0)  # 初始分类器为空
+    prev_encoder = None
+    prev_classifier = None
+    memory_data = None
+    proto_features = None  # 关系原型特征
+
+    # 记录准确率的列表（正常/攻击后）
+    task_acc = []  # 每个任务的准确率
+    memory_acc = []  # 跨任务累积准确率
+
+    # 按任务顺序训练
     for i in range(args.task_num):
-        task = taskdatas[i]
-        traindata, _, testdata = task['train'], task['val'], task['test']
-        train_len = task['train_len']
-        testset += testdata
-        new_relations = task['relation']
-        relations += new_relations
-        args.seen_rel_num = len(relations)
+        logger.info(f"{blue_print}===== Training Task {i} =====")
 
-        # print some info
-        logger.info(f"{yellow_print}Training task {i}, relation set {task['relation']}.{default_print}")
+        # 1. 加载当前任务数据
+        traindata, testdata = processor.get(i)
+        train_len = processor.get_len(i)
+        logger.info(f"Task {i} - Train samples: {len(traindata)}, Test samples: {len(testdata)}")
 
-        # train and val on task data
-        current_encoder = BertEncoder(args, tokenizer, encode_style=args.encode_style)
-        current_classifier = Classifier(args, args.hidden_dim, args.seen_rel_num, prev_classifier).to(args.device)
+        # 2. 初始化当前任务的分类器（增量扩展）
+        current_classifier.incremental_learning(train_len)
+        current_classifier.to(device)
 
-        if prev_encoder is not None:
-            current_encoder.load_state_dict(prev_encoder.state_dict())
-        if args.dataset_name == "FewRel":
-            current_encoder = train_val_task(args, current_encoder, current_classifier, traindata, testdata, rel2id, train_len)
-        else:
-            aug_traindata = get_augmentative_data(args, traindata, train_len)
-            current_encoder = train_val_task(args, current_encoder, current_classifier, aug_traindata, testdata, rel2id, train_len)
+        # 3. 训练当前任务
+        logger.info(f"Training on task {i}...")
+        train_val_task(
+            args, current_encoder, current_classifier, traindata,
+            tokenizer, rel2id, i, prev_encoder, prev_classifier, memory_data
+        )
 
-        # memory select
-        logger.info(f'{blue_print}Selecting memory for task {i}...{default_print}')
-        new_memory, new_memory_len = memory_select(args, current_encoder, traindata, train_len)
-        memory += new_memory
-        memory_len += new_memory_len
-
-        # evaluate on task testdata
+        # 4. 生成当前任务的关系原型
         current_prototypes, current_proto_features = get_prototypes(args, current_encoder, traindata, train_len)
-        acc = evaluate(args, current_encoder, current_classifier, testdata, rel2id)
-        logger.info(f'{blue_print}Accuracy of task {i} is {acc}.{default_print}')
-        task_acc.append(acc)
-
-        # train and val on memory data
-        if prev_encoder is not None:
-            logger.info(f'{blue_print}Training on memory...{default_print}')
-            task_prototypes = torch.cat([task_prototypes, current_prototypes], dim=0)
-            task_proto_features = torch.cat([task_proto_features, current_proto_features], dim=0)
-
+        if i == 0:
+            prototypes = current_prototypes
+            proto_features = current_proto_features
+        else:
             prototypes = torch.cat([prototypes, current_prototypes], dim=0)
             proto_features = torch.cat([proto_features, current_proto_features], dim=0)
 
-            current_model = (current_encoder, current_classifier)
-            prev_model = (prev_encoder, prev_classifier)
-            aug_memory = get_augmentative_data(args, memory, memory_len)
-            current_encoder = train_val_memory(args, current_model, prev_model, memory, aug_memory, testset, rel2id, memory_len, memory_len, prototypes, proto_features, task_prototypes, task_proto_features)
+        # 5. 评估当前任务（正常+攻击）
+        # 5.1 任务内评估
+        acc_clean = evaluate(args, current_encoder, current_classifier, testdata, rel2id)
+        if args.attack_method is not None:
+            acc_attack = evaluate(
+                args, current_encoder, current_classifier, testdata, rel2id,
+                attack_method=args.attack_method, epsilon=args.epsilon
+            )
+            logger.info(
+                f"{blue_print}Task {i} Accuracy - Clean: {acc_clean:.4f}, Attacked: {acc_attack:.4f}, Drop: {acc_clean - acc_attack:.4f}{default_print}")
+            task_acc.append((acc_clean, acc_attack))
         else:
-            logger.info(f"{blue_print}Initial task, won't train on memory.{default_print}")
+            logger.info(f"{blue_print}Task {i} Accuracy: {acc_clean:.4f}{default_print}")
+            task_acc.append(acc_clean)
 
-        # update prototype
-        logger.info(f'{blue_print}Updating prototypes...{default_print}')
+        # 5.2 跨任务累积评估（所有已训练任务）
+        testset = processor.get_testset(i)  # 累积测试集（任务0-i）
         if prev_encoder is not None:
-            prototypes_replay, proto_features_replay = get_prototypes(args, current_encoder, memory, memory_len)
-            prototypes, proto_features = (1-args.beta)*task_prototypes + args.beta*prototypes_replay, (1-args.beta)*task_proto_features + args.beta*proto_features_replay
-            prototypes = F.layer_norm(prototypes, [args.hidden_dim])
-            proto_features = F.normalize(proto_features, p=2, dim=1)
+            acc_clean = evaluate(args, current_encoder, current_classifier, testset, rel2id, proto_features)
         else:
-            task_prototypes, task_proto_features = current_prototypes, current_proto_features
-            prototypes, proto_features = current_prototypes, current_proto_features
+            acc_clean = evaluate(args, current_encoder, current_classifier, testset, rel2id)
 
-        # test
-        logger.info(f'{blue_print}Evaluating...{default_print}')
-        if prev_encoder is not None:
-            acc = evaluate(args, current_encoder, current_classifier, testset, rel2id, proto_features)
+        if args.attack_method is not None:
+            if prev_encoder is not None:
+                acc_attack = evaluate(
+                    args, current_encoder, current_classifier, testset, rel2id, proto_features,
+                    attack_method=args.attack_method, epsilon=args.epsilon
+                )
+            else:
+                acc_attack = evaluate(
+                    args, current_encoder, current_classifier, testset, rel2id,
+                    attack_method=args.attack_method, epsilon=args.epsilon
+                )
+            logger.info(
+                f"{green_print}Cumulative Accuracy (0-{i}) - Clean: {acc_clean:.4f}, Attacked: {acc_attack:.4f}, Drop: {acc_clean - acc_attack:.4f}{default_print}")
+            memory_acc.append((acc_clean, acc_attack))
         else:
-            acc = evaluate(args, current_encoder, current_classifier, testset, rel2id)
-        logger.info(f'{green_print}Evaluate finished, final accuracy over task 0-{i} is {acc}.{default_print}')
-        memory_acc.append(acc)
+            logger.info(f"{green_print}Cumulative Accuracy (0-{i}): {acc_clean:.4f}{default_print}")
+            memory_acc.append(acc_clean)
 
-        # save checkpoint
-        logger.info(f'{blue_print}Saving checkpoint of task {i}...{default_print}')
-        save_checkpoint(args, current_encoder, i_exp, i, "encoder")
-        save_checkpoint(args, current_classifier, i_exp, i, "classifier")
+        # 6. 记忆样本选择与更新
+        if args.memory_size > 0:
+            # 从当前任务选择记忆样本
+            new_memory = memory_select(args, traindata, current_encoder, current_classifier, train_len)
+            memory_data = new_memory if memory_data is None else memory_data + new_memory
+            # 用记忆样本进行抗遗忘训练
+            logger.info(f"Training on memory data (size: {len(memory_data)})...")
+            train_val_memory(
+                args, current_encoder, current_classifier, memory_data,
+                tokenizer, rel2id, i, proto_features
+            )
 
-        prev_encoder = current_encoder
-        prev_classifier = current_classifier
+        # 7. 保存当前模型作为下一轮的前置模型
+        prev_encoder = copy.deepcopy(current_encoder)
+        prev_classifier = copy.deepcopy(current_classifier)
+        torch.cuda.empty_cache()
 
-        nni.report_intermediate_result(acc)
+    # 8. 最终结果统计
+    logger.info(f"{red_print}===== Final Results =====")
+    if args.attack_method is not None:
+        # 任务内准确率统计
+        task_clean = [x[0] for x in task_acc]
+        task_attack = [x[1] for x in task_acc]
+        avg_task_clean = sum(task_clean) / len(task_clean)
+        avg_task_attack = sum(task_attack) / len(task_attack)
+        logger.info(
+            f"Task Avg - Clean: {avg_task_clean:.4f}, Attacked: {avg_task_attack:.4f}, Avg Drop: {avg_task_clean - avg_task_attack:.4f}")
+
+        # 跨任务准确率统计
+        memory_clean = [x[0] for x in memory_acc]
+        memory_attack = [x[1] for x in memory_acc]
+        avg_memory_clean = sum(memory_clean) / len(memory_clean)
+        avg_memory_attack = sum(memory_attack) / len(memory_attack)
+        logger.info(
+            f"Cumulative Avg - Clean: {avg_memory_clean:.4f}, Attacked: {avg_memory_attack:.4f}, Avg Drop: {avg_memory_clean - avg_memory_attack:.4f}")
+    else:
+        avg_task = sum(task_acc) / len(task_acc) if task_acc else 0
+        avg_memory = sum(memory_acc) / len(memory_acc) if memory_acc else 0
+        logger.info(f"Average Task Accuracy: {avg_task:.4f}")
+        logger.info(f"Average Cumulative Accuracy: {avg_memory:.4f}")
 
     return task_acc, memory_acc
 
@@ -327,44 +395,62 @@ def replay_loss(args, cls, prev_cls, hidden, feature, prev_hidden, prev_feature,
     return rep_loss
 
 
+# main.py
 def evaluate(args, model, classifier, valdata, rel2id, proto_features=None, attack_method=None, epsilon=0.01):
     model.eval()
     dataloader = DataLoader(valdata, batch_size=args.test_batch_size, collate_fn=collate_fn, drop_last=False)
-    pred_labels, golden_labels = [], []
+    pred_clean, pred_attack, golden = [], [], []  # 分别存储正常/攻击/真实标签
 
-    for i, batch in enumerate(tqdm(dataloader)):
-        inputs = {
+    for batch in tqdm(dataloader):
+        # 原始输入
+        clean_inputs = {
             'input_ids': batch[0].to(args.device),
             'attention_mask': batch[1].to(args.device),
             'h_index': batch[2].to(args.device),
             't_index': batch[3].to(args.device),
         }
-        labels = batch[4].to(args.device)
+        labels = batch[4]
+        golden.extend(labels.tolist())
 
-        # 应用攻击（如果指定了攻击方法）
-        if attack_method == 'fgsm':
-            from attack import fgsm_attack
-            inputs = fgsm_attack(model, inputs, labels, epsilon=epsilon)
-
+        # 1. 正常评估（无攻击）
         with torch.no_grad():
-            hidden, feature = model(**inputs)
-            logits = classifier(hidden)[0]
-            prob_cls = F.softmax(logits, dim=1)
+            hidden_clean, feature_clean = model(** clean_inputs)
+            logits_clean = classifier(hidden_clean)[0]
+            prob_clean = F.softmax(logits_clean, dim=1)
             if proto_features is not None:
-                logits = torch.mm(feature, proto_features.T) / args.cl_temp
-                prob_ncm = F.softmax(logits, dim=1)
-                final_prob = args.alpha*prob_cls + (1-args.alpha)*prob_ncm
+                logits_ncm = torch.mm(feature_clean, proto_features.T) / args.cl_temp
+                prob_ncm = F.softmax(logits_ncm, dim=1)
+                final_prob_clean = args.alpha * prob_clean + (1 - args.alpha) * prob_ncm
             else:
-                final_prob = prob_cls
+                final_prob_clean = prob_clean
+        pred_clean.extend(torch.argmax(final_prob_clean, dim=1).cpu().tolist())
 
-        pred_labels += torch.argmax(final_prob, dim=1).cpu().tolist()
-        golden_labels += batch[4].tolist()
+        # 2. 攻击评估（若指定攻击方法）
+        if attack_method is not None:
+            from attack import fgsm_attack  # 导入攻击函数
+            # 生成对抗样本（扰动嵌入向量）
+            perturbed_inputs = fgsm_attack(model, clean_inputs, labels.to(args.device), epsilon=epsilon)
+            with torch.no_grad():
+                # 用扰动后的嵌入向量评估
+                hidden_attack, feature_attack = model(**perturbed_inputs)
+                logits_attack = classifier(hidden_attack)[0]
+                prob_attack = F.softmax(logits_attack, dim=1)
+                if proto_features is not None:
+                    logits_ncm_attack = torch.mm(feature_attack, proto_features.T) / args.cl_temp
+                    prob_ncm_attack = F.softmax(logits_ncm_attack, dim=1)
+                    final_prob_attack = args.alpha * prob_attack + (1 - args.alpha) * prob_ncm_attack
+                else:
+                    final_prob_attack = prob_attack
+            pred_attack.extend(torch.argmax(final_prob_attack, dim=1).cpu().tolist())
 
     # 计算准确率
-    pred_labels = torch.tensor(pred_labels, dtype=torch.long)
-    golden_labels = torch.tensor(golden_labels, dtype=torch.long)
-    acc = float(torch.sum(pred_labels==golden_labels).item()) / float(len(golden_labels))
-    return acc
+    golden = torch.tensor(golden)
+    acc_clean = (torch.tensor(pred_clean) == golden).float().mean().item()
+    if attack_method is not None:
+        acc_attack = (torch.tensor(pred_attack) == golden).float().mean().item()
+        return acc_clean, acc_attack  # 返回正常/攻击后的准确率
+    else:
+        return acc_clean
 
 
 if __name__ == "__main__":
@@ -447,13 +533,31 @@ if __name__ == "__main__":
         if args.read_from_task_order:
             processor.set_read_from_order(i)
 
+        # 在main函数中，调用do_train后
         task_acc, memory_acc = do_train(args, tokenizer, processor, i)
-        logging(f'{green_print}Result of experiment {i}:')
-        logging(f'task acc: {task_acc}')
-        logging(f'memory acc: {memory_acc}')
-        logging(f'Average: {sum(memory_acc)/len(memory_acc)}{default_print}')
-        task_results.append(task_acc)
-        memory_results.append(memory_acc)
+
+        # 统计攻击相关结果
+        if args.attack_method is not None:
+            # 任务内准确率统计
+            task_clean = [x[0] for x in task_acc]
+            task_attack = [x[1] for x in task_acc]
+            avg_task_clean = sum(task_clean) / len(task_clean)
+            avg_task_attack = sum(task_attack) / len(task_attack)
+            logger.info(
+                f'{red_print}任务内平均准确率 - 正常: {avg_task_clean}, 攻击后: {avg_task_attack}, 平均下降: {avg_task_clean - avg_task_attack:.4f}{default_print}')
+
+            # 跨任务准确率统计
+            memory_clean = [x[0] for x in memory_acc]
+            memory_attack = [x[1] for x in memory_acc]
+            avg_memory_clean = sum(memory_clean) / len(memory_clean)
+            avg_memory_attack = sum(memory_attack) / len(memory_attack)
+            logger.info(
+                f'{red_print}跨任务平均准确率 - 正常: {avg_memory_clean}, 攻击后: {avg_memory_attack}, 平均下降: {avg_memory_clean - avg_memory_attack:.4f}{default_print}')
+        else:
+            # 原统计逻辑（无攻击）
+            avg_task = sum(task_acc) / len(task_acc)
+            avg_memory = sum(memory_acc) / len(memory_acc)
+            logger.info(f'Average task accuracy: {avg_task}, Average memory accuracy: {avg_memory}')
         # torch.cuda.empty_cache()
     e = time.time()
 
